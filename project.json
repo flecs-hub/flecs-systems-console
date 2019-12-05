@@ -1,0 +1,11 @@
+{
+    "id": "flecs.systems.console",
+    "type": "package",
+    "value": {
+        "author": "Sander Mertens",
+        "description": "Command line interface for inspecting Flecs internals",
+        "use": [
+            "flecs"
+        ]
+    }
+}
