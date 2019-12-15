@@ -5,6 +5,7 @@ typedef struct ui_thread_t {
     ecs_world_t *world;
     ecs_entity_t console_entity;
     ecs_os_mutex_t mutex;
+    ecs_snapshot_t *snapshot;
 } ui_thread_t;
 
 typedef struct ConsoleUiThread {
@@ -80,6 +81,29 @@ char* read_cmd(
 }
 
 static
+const char* parse_arg(
+    const char *args,
+    char *arg)
+{
+    char *bptr = arg, ch;
+    const char *ptr = args;
+
+    while ((ch = *ptr) && ch && !isspace(ch)) {
+        *bptr = ch;
+        bptr ++;
+        ptr ++;
+    }
+
+    if (!ch) {
+        return NULL;
+    }
+
+    *bptr = '\0';
+
+    return ptr;   
+}
+
+static
 const char* is_cmd(
     const char *cmd, 
     const char *str) 
@@ -92,7 +116,7 @@ const char* is_cmd(
         }  else {
             return cmd + len;
         }
-    } else if (cmd[0] == str[0]) {
+    } else if (cmd[0] == str[0] && (!cmd[1] || isspace(cmd[1]))) {
         if (cmd[1]) {
             return cmd + 1 + 1;
         } else {
@@ -204,7 +228,7 @@ void print_type_details(
     ecs_dbg_table_t *dbg_table,
     uint32_t column_width)
 {
-    print_column("shared:", column_width);
+    print_column("type (shared):", column_width);
     if (dbg_table->shared) {
         char *type_expr = ecs_type_to_expr(world, dbg_table->shared);
         printf("[%s]\n", type_expr);
@@ -213,7 +237,7 @@ void print_type_details(
         printf("-\n");
     }
 
-    print_column("container:", column_width);
+    print_column("type (container):", column_width);
     if (dbg_table->container) {
         char *type_expr = ecs_type_to_expr(world, dbg_table->container);
         printf("[%s]\n", type_expr);
@@ -267,9 +291,11 @@ int dump_entity(
     }
 
     type_expr = ecs_type_to_expr(world, dbg.type);
-    print_column("type:", column_width);
+    print_column("type (owned):", column_width);
     printf("[%s]\n", type_expr);
     free(type_expr);
+
+    print_type_details(world, &dbg_table, column_width);
 
     print_column("matched with:", column_width);
     if (!print_matched_with(world, &dbg_table)) {
@@ -340,7 +366,7 @@ void print_table_summary(
         type_expr = ecs_type_to_expr(world, dbg.type);
     }
 
-    print_column("[%s]", 48, type_expr);
+    print_column("[%s]", 64, type_expr);
     print_column("%d", 12, dbg.entities_count);
 
     ecs_os_free(type_expr);  
@@ -359,7 +385,7 @@ int dump_tables(
 {
     printf("\n");
     print_column("id", 4);
-    print_column("type", 48);
+    print_column("type", 64);
     print_column("entities", 12);
     print_column("matched with", 0);
     print_line(4 + 48 + 16 + strlen("matched with"));
@@ -396,7 +422,7 @@ int dump_table(
     ecs_dbg_table(world, table, &dbg);
 
     char *type_expr = ecs_type_to_expr(world, dbg.type);
-    print_column("type:", column_width);
+    print_column("type (owned):", column_width);
     printf("[%s]\n", type_expr);
     ecs_os_free(type_expr);
 
@@ -545,11 +571,280 @@ int cmd_system(
 }
 
 static
+int cmd_match(
+    ecs_world_t *world,
+    const char *args)
+{
+    char arg[256];
+    const char *ptr = parse_arg(args, arg);
+    if (!ptr) {
+        return -1;
+    }
+
+    /* Skip whitespace */
+    ptr ++;
+
+    ecs_entity_t e = parse_entity_id(world, arg);
+    if (!e) {
+        return -1;
+    }     
+
+    ecs_entity_t system = parse_entity_id(world, ptr);
+    if (!system) {
+        return -1;
+    }
+
+    ecs_dbg_match_failure_t failure_info = {0};
+    if (ecs_dbg_match_entity(world, e, system, &failure_info)) {
+        printf("entitiy '%s' matches with system '%s'\n", 
+            arg, ecs_get_id(world, system));
+    } else {
+        printf("entity '%s' does not match with system '%s'\n", 
+            arg, ecs_get_id(world, system));
+
+        ecs_type_t type = NULL;
+        char *type_expr = NULL;
+
+        if (failure_info.column) {
+            type = ecs_dbg_get_column_type(
+                world, system, failure_info.column);
+            type_expr = ecs_type_to_expr(world, type);
+            printf("column %d: ", failure_info.column);
+        }
+
+        switch(failure_info.reason) {
+        case EcsMatchOk:
+            break;
+        case EcsMatchNotASystem:
+            printf("entity '%s' is not a system\n", ptr);
+            break;
+        case EcsMatchSystemIsATask:
+            printf("system is a task\n");
+            break;
+        case EcsMatchEntityIsDisabled:
+            printf("entity is disabled\n");
+            break;
+        case EcsMatchEntityIsPrefab:
+            printf("entity is a prefab\n");
+            break;
+        case EcsMatchFromSelf:
+            printf("[%s] missing (owned or shared)\n", type_expr);
+            break;
+        case EcsMatchFromOwned:
+            printf("[%s] missing (owned)\n", type_expr);
+            break;
+        case EcsMatchFromShared:
+            printf("[%s] missing (shared)\n", type_expr);
+            break;
+        case EcsMatchFromContainer:
+            printf("[%s] missing (container)\n", type_expr);
+            break;
+        case EcsMatchFromEntity:
+            printf(
+                "[%s] missing (from entity, system will never run!)\n", 
+                type_expr);
+            break;
+        case EcsMatchOrFromSelf:
+            printf("[%s] missing in OR expression (owned or shared)\n", type_expr);
+            break;
+        case EcsMatchOrFromContainer:
+            printf("[%s] missing in OR expression (from container)\n", type_expr);
+            break;
+        case EcsMatchNotFromSelf:
+            printf("has [%s] from NOT expression (owned or shared)\n", type_expr);
+            break;
+        case EcsMatchNotFromOwned:
+            printf("has [%s] in NOT expression (owned)\n", type_expr);
+            break;
+        case EcsMatchNotFromShared:
+            printf("has [%s] in NOT expression (shared)\n", type_expr);
+            break;
+        case EcsMatchNotFromContainer:
+            printf("has [%s] in NOT expression (from container)\n", type_expr);
+            break;
+        }
+
+        ecs_os_free(type_expr);      
+    }
+
+    return 0;
+}
+
+static
+int cmd_add_remove(
+    ecs_world_t *world,
+    const char *args,
+    bool is_remove)
+{
+    char arg[256];
+    const char *ptr = parse_arg(args, arg);
+    if (!ptr) {
+        return -1;
+    }
+
+    /* Skip whitespace */
+    ptr ++;
+
+    ecs_entity_t e = parse_entity_id(world, arg);
+    if (!e) {
+        return -1;
+    }
+
+    ecs_type_t type;
+
+    if (ptr[0] == '[') {
+        ecs_type_filter_t filter = {0};
+        if (parse_type_filter(world, ptr, &filter)) {
+            return -1;
+        }
+
+        type = filter.include;
+    } else {
+        ecs_entity_t component = parse_entity_id(world, ptr);
+        if (!component) {
+            return -1;
+        }
+
+        type = ecs_type_from_entity(world, component);
+    }
+
+    char *type_expr = ecs_type_to_expr(world, type);
+
+    if (is_remove) {
+        if (!_ecs_has_owned(world, e, type)) {
+            if (_ecs_has(world, e, type)) {
+                printf("entity '%s' does not own [%s]\n", arg, type_expr);
+            } else {
+                printf("entity '%s' does not have [%s]\n", arg, type_expr);
+            }
+        } else {
+            _ecs_remove(world, e, type);
+            if (_ecs_has(world, e, type)) {
+                printf("removed override [%s] from entity '%s'\n", type_expr, arg);
+            } else {
+                printf("removed [%s] from entity '%s'\n", type_expr, arg);
+            }
+        }
+    } else {
+        if (_ecs_has_owned(world, e, type)) {
+            printf("entity '%s' already has [%s]\n", arg, type_expr);
+        } else {
+            if (_ecs_has(world, e, type)) {
+                _ecs_add(world, e, type);
+                printf("overridden [%s] for entity '%s'\n", type_expr, arg);
+            } else {
+                _ecs_add(world, e, type);
+                printf("added [%s] to entity '%s'\n", type_expr, arg);
+            }
+        }
+    }
+
+    ecs_os_free(type_expr);
+
+    return 0;
+}
+
+static
+int cmd_delete(
+    ecs_world_t *world,
+    const char *args)
+{
+    ecs_entity_t e = parse_entity_id(world, args);
+    if (!e) {
+        return -1;
+    }
+
+    ecs_delete(world, e);
+    printf("deleted entity '%s'\n", args);
+
+    return 0;
+}
+
+static
+void cmd_help()
+{
+    printf("Commands:\n");
+    printf(" - [e]ntity entity                  - Display information about one or more matching entities\n");
+    printf(" - [t]able  entity                  - Display information about one or more matching tables\n");
+    printf(" - [s]ystem system                  - Display information about a matching system\n");
+    printf(" - [m]atch  entity system           - Display if entity matches with system and why (not)\n");
+    printf(" - [a]dd entity component           - Add component to entity\n");
+    printf(" - [r]emove entity component        - Remove entity from component\n");
+    printf(" - [d]elete entity                  - Delete entity\n");
+    printf(" - snapshot                         - Take a snapshot of the current state\n");
+    printf(" - restore                          - Restore the previous snapshot\n");
+    printf("\n");
+    printf(" entity can be any of the following:\n");
+    printf(" - id         (e.g. 42)\n");
+    printf(" - name       (e.g. MyEntity)\n");
+    printf(" - expression (e.g. [Position, Velocity], matches multiple)\n");
+    printf("\n");
+    printf(" component, system can be any of the following:\n");
+    printf(" - id         (e.g. 42)\n");
+    printf(" - name       (e.g. MyEntity)\n");
+    printf("\n");
+    printf(" If no argument is provided for either 'entity' or 'table', all entities or tables\n");
+    printf(" are shown, respectively.\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  entity 42\n");
+    printf("  e 42\n");
+    printf("  e MyEntity\n");
+    printf("  e [Position, Velocity]\n");
+    printf("  add 42 Position\n");
+    printf("  match 42 Move\n");
+    printf("\n");
+}
+
+int cmd_snapshot(
+    ecs_world_t *world, 
+    const char *args, 
+    ui_thread_t *ctx)
+{
+    if (ctx->snapshot) {
+        ecs_snapshot_free(world, ctx->snapshot);
+    }
+
+    if (args[0] == '[') {
+        ecs_type_filter_t filter = {0};
+        if (parse_type_filter(world, args, &filter)) {
+            return -1;
+        }
+
+        ctx->snapshot = ecs_snapshot_take(world, &filter);
+    } else {
+        ctx->snapshot = ecs_snapshot_take(world, NULL);
+    }
+
+    return 0;
+}
+
+int cmd_restore(
+    ecs_world_t *world,
+    ui_thread_t *ctx)
+{
+    if (!ctx->snapshot) {
+        return -1;
+    }
+
+    ecs_snapshot_restore(world, ctx->snapshot);
+    
+    ctx->snapshot = NULL;
+
+    return 0;
+}
+
+static
 int parse_cmd(
     ecs_world_t *world, 
-    const char *cmd) 
+    const char *cmd,
+    ui_thread_t *ctx) 
 {
     const char *args;
+
+    if (!cmd[0]) {
+        return 0;
+    }
 
     if ((args = is_cmd(cmd, "table"))) {
         return cmd_table(world, args);
@@ -560,8 +855,31 @@ int parse_cmd(
     if ((args = is_cmd(cmd, "entity"))) {
         return cmd_entity(world, args);
     } else
+    if ((args = is_cmd(cmd, "match"))) {
+        return cmd_match(world, args);
+    } else
+    if ((args = is_cmd(cmd, "add"))) {
+        return cmd_add_remove(world, args, false);
+    } else
+    if ((args = is_cmd(cmd, "remove"))) {
+        return cmd_add_remove(world, args, true);
+    } else    
+    if ((args = is_cmd(cmd, "delete"))) {
+        return cmd_delete(world, args);
+    } else
+    if ((args = is_cmd(cmd, "help"))) {
+        cmd_help();
+        return 0;
+    } else
     if ((args = is_cmd(cmd, "quit"))) {
         ecs_quit(world);
+        return 0;
+    } else
+    if ((args = is_cmd(cmd, "snapshot"))) {
+        return cmd_snapshot(world, args, ctx);
+    } else
+    if ((args = is_cmd(cmd, "restore"))) {
+        return cmd_restore(world, ctx);
     }
 
     return -1;
@@ -579,7 +897,9 @@ void* ui_thread(void *arg) {
         char *cmd = read_cmd(stdin);
 
         ecs_os_mutex_lock(ctx->mutex);
-        parse_cmd(world, cmd);
+        if (parse_cmd(world, cmd, ctx)) {
+            printf("error executing '%s'\n", cmd);
+        }
         ecs_os_mutex_unlock(ctx->mutex);
 
         free(cmd);
@@ -597,6 +917,7 @@ void EcsStartUiThread(ecs_rows_t *rows) {
         ctx->world = rows->world;
         ctx->console_entity = rows->entities[i];
         ctx->mutex = ecs_os_mutex_new();
+        ctx->snapshot = NULL;
 
         /* Lock mutex, which will prevent the thread from doing unsafe access
          * on the world */
@@ -617,14 +938,16 @@ static
 void EcsRunConsole(ecs_rows_t *rows) {
     ECS_COLUMN(rows, ConsoleUiThread, thr, 1);
 
+    ui_thread_t *ctx = thr->ctx;
+
     /* Unlock and relock the mutex to give the UI thread the opportunity to
      * do operations */
-    ecs_os_mutex_unlock(thr->ctx->mutex);
+    ecs_os_mutex_unlock(ctx->mutex);
 
     /* ui thread does something ... */
-    ecs_os_sleep(0, 100000000);
+    ecs_os_sleep(0, 10000000);
 
-    ecs_os_mutex_lock(thr->ctx->mutex);
+    ecs_os_mutex_lock(ctx->mutex);
 }
 
 void FlecsSystemsConsoleImport(
